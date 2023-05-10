@@ -17,8 +17,16 @@ foreach ($url in $urls) {
         DestinationURL = $null
     }
 
+   
+    #add the connetion method in case the string does not contain it by default
+    if ($url.Contains("http://")){
+        $url = $url.Replace('http://','https://') 
+    }elseif($url -notcontains("https://")){
+      $url = "https://$url"
+    }
+   
     # Create a new HTTP request
-    $request = [System.Net.HttpWebRequest]::Create($url)
+    $request = [System.Net.HttpWebRequest]::Create("$url")
     $request.Method = "HEAD"
     $request.AllowAutoRedirect = $false
 
