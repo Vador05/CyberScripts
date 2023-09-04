@@ -1,5 +1,7 @@
 import csv
 import requests
+import argparse
+import os
 from urllib.parse import urlparse, urlunparse
 from selenium import webdriver
 from datetime import datetime
@@ -7,23 +9,32 @@ from datetime import datetime
 # Input and output file paths
 input_file = "urls.txt"
 output_file = "results.csv"
+screenshot_folder = "Screenshots"  # Folder to store screenshots
+
+# Initialize parser
+parser = argparse.ArgumentParser()
+
+# Adding optional argument
+parser.add_argument("-s", "--screenshot", action="store_true", help="This option takes a screenshot of each of the URLs inspected")
+
+args = parser.parse_args()
+
+# Create the screenshot folder if it doesn't exist
+if args.screenshot and not os.path.exists(screenshot_folder):
+    os.makedirs(screenshot_folder)
 
 # Initialize the list to store results
 results = []
 
 # Function to capture a screenshot
-def capture_screenshot(url):
+def capture_screenshot(url, filename):
     options = webdriver.ChromeOptions()
     options.add_argument("--headless")  # Run Chrome in headless mode (no GUI)
     driver = webdriver.Chrome(chrome_options=options)
     driver.get(url)
     
-    # Get the current date and time
-    current_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    
-    # Save the screenshot with the URL and timestamp
-    screenshot_filename = f"{url.replace('/', '_').replace(':', '_')}_{current_time}.png"
-    driver.save_screenshot(screenshot_filename)
+    # Save the screenshot with the specified filename
+    driver.save_screenshot(filename)
     driver.quit()
 
 # Read URLs from the input file
@@ -47,9 +58,17 @@ for raw_url in urls:
         # If it's a redirect (status code 300-309), get the redirection target URL
         redirect_url = response.headers.get("Location")
 
+        # Capture a screenshot of the redirected URL
+        if args.screenshot:
+            # Generate a filename based on the redirected URL
+            redirect_filename = os.path.join(screenshot_folder, f"{redirect_url.replace('/', '_').replace(':', '_')}.png")
+            capture_screenshot(redirect_url, redirect_filename)
+
     # Capture a screenshot if the --screenshot option is provided
-    if "--screenshot" in import sys.argv:
-        capture_screenshot(url)
+    if args.screenshot:
+        # Generate a filename based on the original URL
+        screenshot_filename = os.path.join(screenshot_folder, f"{url.replace('/', '_').replace(':', '_')}.png")
+        capture_screenshot(url, screenshot_filename)
 
     # Append the result to the list
     results.append([url, response_code, redirect_url])
