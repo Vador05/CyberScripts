@@ -69,9 +69,12 @@ if __name__ == "__main__":
         with open(args.file, 'r') as csv_file:
             reader = csv.reader(csv_file)
             for row in reader:
-                if args.verbose: 
-                    print("Processing {}".format(row[0]))
-                processURL(row[0])
+                try: 
+                    if args.verbose: 
+                        print("Processing {}".format(row[0]))
+                    processURL(row[0])
+                except: 
+                    print("Encountered issues when processing {}".format(row[0]))            
     else: 
         url = input("Enter a URL (without https:// or www.): ").strip()
         processURL(url)
