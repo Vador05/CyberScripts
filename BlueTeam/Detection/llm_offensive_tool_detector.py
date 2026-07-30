@@ -1,0 +1,1 @@
+("delimiter_injection", re.compile(r"(###\s*system|<\|system\|>|---\s*system\s*---|={3,}\s*system)", re.I), "medium"),

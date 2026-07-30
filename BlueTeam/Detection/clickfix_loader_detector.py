@@ -1,181 +1,160 @@
-"""
-ClickFix Loader Detector - Scans plain text logs for BabaDeda, Lorem Ipsum, and Potemkin loader patterns.
+#!/usr/bin/env python3
+"""ClickFix Loader Detector — scans EDR/PowerShell/audit logs for ClickFix loader indicators.
 
 Usage:
-    python clickfix_loader_detector.py /var/log/app.log
-    python clickfix_loader_detector.py /var/log/app.log --severity medium
-    python clickfix_loader_detector.py /var/log/app.log --rules babadeda_msiexec,lorem_ipsum_wscript
+    python clickfix_loader_detector.py audit.log
+    python clickfix_loader_detector.py edr_export.txt --min-severity medium
+    python clickfix_loader_detector.py transcript.log --iocs extra_iocs.json --min-severity high
 """
 
 import argparse
+import json
 import re
 import sys
-from datetime import datetime
+from pathlib import Path
 
+RULES = {
+    "Lure": [
+        (r"(?i)press\s+windows\s*\+\s*r|win\s*\+\s*r\b", "WindowsRunPrompt", "medium"),
+        (r"(?i)paste\s+(in|into)\s+(the\s+)?run", "PasteInRun", "medium"),
+        (r"(?i)i\s+am\s+not\s+a\s+robot.{0,40}verif", "FakeCaptcha", "medium"),
+        (r"(?i)verification\s+steps|human\s+verification", "FakeVerification", "medium"),
+        (r"(?i)(browser.fix|fix.*browser|update.*required.*paste|press.*run.*dialog)", "FakeBrowserFix", "medium"),
+        (r"(?i)mshta\s+https?://", "MshtaLure", "high"),
+        (r"(?i)(clipboard|ctrl\s*\+\s*v).{0,60}https?://", "ClipboardURL", "medium"),
+    ],
+    "Fetch": [
+        (r"(?i)msiexec\s+(/[qi]\s+){1,2}https?://", "MsiexecRemoteFetch", "high"),
+        (r"(?i)msiexec.+https?://.+\.(msi|exe|ps1)", "MsiexecPayload", "high"),
+        (r"(?i)certutil\s+(-urlcache\s+-f|-f\s+-urlcache)\s+https?://", "CertutilDownload", "high"),
+        (r"(?i)(curl|wget)\s+.+https?://.+\.(exe|ps1|bat|vbs|dll)", "CurlWgetPayload", "high"),
+        (r"(?i)regsvr32.+scrobj\.dll", "Regsvr32Scrobj", "high"),
+        (r"(?i)bitsadmin\s+/transfer\s+\S+\s+https?://", "BitsadminDownload", "high"),
+    ],
+    "Execute": [
+        (r"(?i)powershell.+-[Ee]nc(odedcommand)?[\s=]+[A-Za-z0-9+/]{20}", "PSEncodedCommand", "high"),
+        (r"(?i)powershell.+-[Ww]indow[Ss]tyle\s+[Hh]idden", "PSHidden", "medium"),
+        (r"(?i)(wscript|cscript)\s+.+https?://", "ScriptRemoteExec", "high"),
+        (r"(?i)rundll32.+https?://", "Rundll32Remote", "high"),
+        (r"(?i)rundll32.+\\[Tt]emp\\.+\.dll", "Rundll32TempDLL", "high"),
+        (r"(?i)powershell.+\bIEX\b.+[Nn]et\.?[Ww]eb[Cc]lient", "PSIEXDownload", "high"),
+        (r"(?i)invoke-expression.+https?://", "InvokeExpressionURL", "high"),
+    ],
+}
 
 SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 
-def build_ruleset():
-    return {
-        "babadeda_msiexec": {
-            "pattern": re.compile(r"msiexec(?:\.exe)?\s+/[iq]\s+[\"']?([^\s\"']+\.msi)[\"']?", re.IGNORECASE),
-            "severity": "high",
-            "family": "BabaDeda",
-            "description": "MSI silent install via msiexec matching BabaDeda delivery",
-            "ioc_group": 1,
-        },
-        "babadeda_regsvr": {
-            "pattern": re.compile(r"regsvr32(?:\.exe)?\s+(?:/s\s+)?[\"']?([^\s\"']+\.(?:dll|ocx))[\"']?", re.IGNORECASE),
-            "severity": "high",
-            "family": "BabaDeda",
-            "description": "regsvr32 silent DLL/OCX registration used by BabaDeda",
-            "ioc_group": 1,
-        },
-        "babadeda_wmic_process": {
-            "pattern": re.compile(r"wmic\s+process\s+call\s+create\s+[\"']?([^\"'\n]{5,100})[\"']?", re.IGNORECASE),
-            "severity": "medium",
-            "family": "BabaDeda",
-            "description": "WMIC process creation lateral movement indicator",
-            "ioc_group": 1,
-        },
-        "lorem_ipsum_wscript": {
-            "pattern": re.compile(r"wscript(?:\.exe)?\s+(?://[a-z]+\s+)?[\"']?([^\s\"']+\.(?:js|vbs|wsf))[\"']?", re.IGNORECASE),
-            "severity": "high",
-            "family": "Lorem Ipsum",
-            "description": "WScript executing JS/VBS matching Lorem Ipsum loader stage",
-            "ioc_group": 1,
-        },
-        "lorem_ipsum_certutil": {
-            "pattern": re.compile(r"certutil(?:\.exe)?\s+(?:-decode|-urlcache\s+-(?:f|split))\s+[\"']?([^\s\"']+)[\"']?", re.IGNORECASE),
-            "severity": "high",
-            "family": "Lorem Ipsum",
-            "description": "certutil decode/download used in Lorem Ipsum payload staging",
-            "ioc_group": 1,
-        },
-        "lorem_ipsum_powershell_enc": {
-            "pattern": re.compile(r"powershell(?:\.exe)?\s+.*-[Ee](?:nc(?:odedCommand)?)?\s+([A-Za-z0-9+/=]{20,})", re.IGNORECASE),
-            "severity": "high",
-            "family": "Lorem Ipsum",
-            "description": "PowerShell encoded command execution typical of Lorem Ipsum dropper",
-            "ioc_group": 1,
-        },
-        "lorem_ipsum_temp_exec": {
-            "pattern": re.compile(r"(?:%temp%|\\Temp\\|/tmp/)([^\s\"'\\/:*?<>|]{1,64}\.(?:exe|bat|cmd|ps1))", re.IGNORECASE),
-            "severity": "medium",
-            "family": "Lorem Ipsum",
-            "description": "Executable dropped to temp directory consistent with Lorem Ipsum staging",
-            "ioc_group": 1,
-        },
-        "potemkin_mshta": {
-            "pattern": re.compile(r"mshta(?:\.exe)?\s+[\"']?((?:https?://|vbscript:|javascript:)[^\s\"']{5,200})[\"']?", re.IGNORECASE),
-            "severity": "high",
-            "family": "Potemkin",
-            "description": "mshta remote/script execution matching Potemkin loader delivery",
-            "ioc_group": 1,
-        },
-        "potemkin_rundll32": {
-            "pattern": re.compile(r"rundll32(?:\.exe)?\s+[\"']?([^\s\"',]+\.dll)[\"']?,\s*([^\s\"']+)", re.IGNORECASE),
-            "severity": "high",
-            "family": "Potemkin",
-            "description": "rundll32 DLL export invocation used by Potemkin loader",
-            "ioc_group": 1,
-        },
-        "potemkin_clipboard_cmd": {
-            # Bounded [^\n]{0,N} replaces nested .* alternation to prevent ReDoS on adversarial lines.
-            "pattern": re.compile(r"(?:cmd(?:\.exe)?|powershell(?:\.exe)?)\s+[^\n]{0,200}(?:/c|/k|-c|-Command)\s+[\"']?([^\n]{0,100}(?:clip|paste)[^\n]{0,100})", re.IGNORECASE),
-            "severity": "medium",
-            "family": "Potemkin",
-            "description": "Clipboard-sourced command execution typical of ClickFix/Potemkin social engineering",
-            "ioc_group": 1,
-        },
-        "clickfix_win_r_pattern": {
-            "pattern": re.compile(r"(?:Win\+R|winrun|run dialog).*?(powershell|cmd|mshta|wscript|rundll32)", re.IGNORECASE),
-            "severity": "medium",
-            "family": "ClickFix",
-            "description": "Win+R dialog abuse pattern common across all ClickFix loader families",
-            "ioc_group": 1,
-        },
-        "suspicious_lolbin_chain": {
-            "pattern": re.compile(r"(cmd|powershell|wscript|mshta|rundll32|regsvr32|certutil|msiexec).*?(cmd|powershell|wscript|mshta|rundll32|regsvr32|certutil|msiexec)", re.IGNORECASE),
-            "severity": "low",
-            "family": "Generic",
-            "description": "Chained LOLBin execution pattern consistent with ClickFix campaigns",
-            "ioc_group": 0,
-        },
-    }
-
-
-def scan_log(log_path, rules, min_severity):
-    findings = []
-    min_level = SEVERITY_ORDER[min_severity]
-    seen = set()
+def load_rules(iocs_path):
+    compiled = {stage: [(re.compile(p), name, sev) for p, name, sev in entries]
+                for stage, entries in RULES.items()}
+    if not iocs_path:
+        return compiled
     try:
-        with open(log_path, "r", errors="replace") as fh:
-            for lineno, raw in enumerate(fh, start=1):
-                line = raw.rstrip("\n")
-                for rule_name, rule in rules.items():
-                    if SEVERITY_ORDER[rule["severity"]] < min_level:
-                        continue
-                    m = rule["pattern"].search(line)
-                    if not m:
-                        continue
-                    ioc = m.group(rule["ioc_group"]) if rule["ioc_group"] and rule["ioc_group"] <= len(m.groups()) else m.group(0)
-                    key = (rule_name, lineno)
-                    if key in seen:
-                        continue
-                    seen.add(key)
+        with open(iocs_path, encoding="utf-8") as fh:
+            extra = json.load(fh)
+        if not isinstance(extra, dict):
+            raise TypeError(f"expected top-level JSON object, got {type(extra).__name__}")
+        extra_compiled = {}
+        for stage, entries in extra.items():
+            stage_rules = []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise TypeError(f"IOC entry must be a dict, got {type(entry).__name__}")
+                stage_rules.append((
+                    re.compile(entry["pattern"], re.IGNORECASE),
+                    entry["name"],
+                    entry.get("severity", "medium"),
+                ))
+            extra_compiled[stage] = stage_rules
+        for stage, rules in extra_compiled.items():
+            compiled.setdefault(stage, []).extend(rules)
+    except (OSError, json.JSONDecodeError, KeyError, AttributeError, TypeError, re.error) as exc:
+        print(f"[WARN] Could not load IOCs from {iocs_path}: {exc}", file=sys.stderr)
+    return compiled
+
+
+def parse_log(log_path):
+    path = Path(log_path)
+    try:
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            text = path.read_text(encoding="latin-1")
+    except OSError as exc:
+        print(f"[ERROR] Cannot open log file: {exc}", file=sys.stderr)
+        sys.exit(2)
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if line.strip() and len(line) <= 4096:
+            yield lineno, line
+
+
+def scan(lines, compiled_rules):
+    findings = []
+    for lineno, line in lines:
+        for stage, rules in compiled_rules.items():
+            for pattern, name, sev in rules:
+                if pattern.search(line):
                     findings.append({
                         "lineno": lineno,
-                        "rule": rule_name,
-                        "severity": rule["severity"],
-                        "family": rule["family"],
-                        "description": rule["description"],
-                        "ioc": ioc.strip()[:500],
-                        "line": line.strip()[:200],
+                        "stage": stage,
+                        "rule": name,
+                        "severity": sev,
+                        "snippet": line.strip()[:120],
                     })
-    except OSError as e:
-        print(f"ERROR: Cannot read log file: {e}", file=sys.stderr)
-        sys.exit(1)
     return findings
 
 
-def report_findings(findings, log_path):
-    if not findings:
-        print(f"[{datetime.utcnow().isoformat()}Z] No matches found in {log_path}")
-        return
-    sorted_findings = sorted(findings, key=lambda f: (-SEVERITY_ORDER[f["severity"]], f["lineno"]))
-    print(f"[{datetime.utcnow().isoformat()}Z] ClickFix Loader Detector — {len(findings)} finding(s) in {log_path}\n")
-    for f in sorted_findings:
-        print(f"MATCH  rule:{f['rule']}  severity:{f['severity'].upper()}  family:{f['family']}")
-        print(f"  line:{f['lineno']}  ioc:{f['ioc']}")
-        print(f"  desc:{f['description']}")
-        print(f"  raw: {f['line']}")
-        print()
+def escalate(findings):
+    has_lure = any(f["stage"] == "Lure" for f in findings)
+    has_action = any(f["stage"] in ("Fetch", "Execute") for f in findings)
+    if not (has_lure and has_action):
+        return findings
+    return [
+        dict(f, severity="high") if f["stage"] == "Lure" and f["severity"] != "high" else f
+        for f in findings
+    ]
+
+
+def report(findings, min_sev):
+    min_ord = SEVERITY_ORDER[min_sev]
+    visible = [f for f in findings if SEVERITY_ORDER[f["severity"]] >= min_ord]
+    stage_counts = {s: 0 for s in RULES}
+    peak = "low"
+    for f in visible:
+        sev = f["severity"]
+        print(f"[{sev.upper():6}] Line {f['lineno']:>6} | Stage:{f['stage']:<8} | "
+              f"Rule:{f['rule']:<30} | {f['snippet']}")
+        stage_counts[f["stage"]] = stage_counts.get(f["stage"], 0) + 1
+        if SEVERITY_ORDER[sev] > SEVERITY_ORDER[peak]:
+            peak = sev
+    print("\n--- Summary ---")
+    for stage in ("Lure", "Fetch", "Execute"):
+        print(f"  {stage:<8}: {stage_counts.get(stage, 0)} hit(s)")
+    print(f"  Peak severity : {peak.upper()}")
+    print(f"  Total emitted : {len(visible)}")
+    return 1 if peak == "high" else 0
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scan plain text logs for ClickFix loader indicators (BabaDeda, Lorem Ipsum, Potemkin).",
-        epilog="Example: python clickfix_loader_detector.py app.log --severity medium --rules babadeda_msiexec,potemkin_mshta",
+        description="Detect ClickFix social-engineering loader indicators in plaintext log exports."
     )
-    parser.add_argument("log_file", help="Path to plain text log file to scan")
-    parser.add_argument("--rules", help="Comma-separated rule names to enable (default: all)")
-    parser.add_argument("--severity", choices=["low", "medium", "high"], default="low", help="Minimum severity threshold (default: low)")
+    parser.add_argument("log_path", help="Path to log file (.txt or .log)")
+    parser.add_argument(
+        "--min-severity", choices=["low", "medium", "high"], default="low",
+        help="Lowest severity level to emit (default: low)"
+    )
+    parser.add_argument(
+        "--iocs", metavar="IOCS_JSON",
+        help="Supplemental JSON file with extra ClickFix C2 signatures to merge"
+    )
     args = parser.parse_args()
 
-    ruleset = build_ruleset()
-
-    if args.rules:
-        requested = set(r.strip() for r in args.rules.split(","))
-        unknown = requested - ruleset.keys()
-        if unknown:
-            print(f"ERROR: Unknown rule(s): {', '.join(sorted(unknown))}. Available: {', '.join(sorted(ruleset.keys()))}", file=sys.stderr)
-            sys.exit(1)
-        ruleset = {k: v for k, v in ruleset.items() if k in requested}
-
-    findings = scan_log(args.log_file, ruleset, args.severity)
-    report_findings(findings, args.log_file)
+    compiled_rules = load_rules(args.iocs)
+    lines = list(parse_log(args.log_path))
+    findings = escalate(scan(lines, compiled_rules))
+    sys.exit(report(findings, args.min_severity))
 
 
 if __name__ == "__main__":
